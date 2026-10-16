@@ -242,7 +242,215 @@ def afshari_stewart_ds_2016(magnitude=7.0, distance=10.0, vs30=760.0, mechanism=
 
     # return
     return np.log(ds_median), ds_sigma, ds_tau, ds_phi
-    
-    
 
 
+def pinilla_ramos_abrahamson_ds_2025(M, Rrup, Vs30, event_type="interface", region="JP",
+                                     epistemic_other_region=False):
+    """
+    Predict D5-75 significant duration using Pinilla-Ramos & Abrahamson (2025).
+
+    Parameters
+    ----------
+    M           : float
+        Moment magnitude
+    Rrup        : float
+        Closest rupture distance (km)
+    Vs30        : float
+        Time-averaged shear-wave velocity in top 30 m (m/s)
+    event_type  : str
+        "interface" or "slab" (intraslab)
+    region      : str
+        "JP" (Japan), "NZ" (New Zealand), "SA" (South America), "TW" (Taiwan, slab only)
+        For Cascadia/US/Alaska or other unlisted regions → use "JP"
+    epistemic_other_region : bool
+        If True, adds 0.10 epistemic uncertainty (ln units) to sigma_ln,
+        as recommended by the authors for regions outside JP/NZ/SA/TW.
+
+    Returns
+    -------
+    dict with keys:
+        D575_median_s   : median D5-75 in seconds
+        sigma_total     : total std dev in s^n2 units (power-normal, NOT ln units)
+        sigma_ln        : equivalent std dev of ln(D5-75), (ln D84 - ln D16)/2,
+                          including the epistemic term if epistemic_other_region=True
+        D575_16th_s     : 16th percentile D5-75 (seconds)
+        D575_84th_s     : 84th percentile D5-75 (seconds)
+        n2              : power-normal exponent used for sigma
+        components      : dict of Dsource, Dpath, Dsite (in seconds)
+        rho_PGA_dur     : correlation coefficient between lnPGA and D5-75 epsilon
+    """
+    # ── Table 1: Region-independent model coefficients ────────────────────────
+    coeffs_global = {
+        "slab": {
+            "c1":  0.340,   # source amplitude at Mth
+            "c2":  0.500,   # exponential magnitude scaling exponent
+            "d1":  2.770,   # linear scaling slope above Mth
+            "M0":  4.250,   # reference magnitude for source term
+            "Mth": 6.000,   # magnitude hinge point (exponential -> linear)
+            "c31": 0.013,   # bilinear path slope (R <= R1)
+            "c32": 0.020,   # bilinear path slope (R > R1)
+            "R1":  250.0,   # path breakpoint distance (km)
+            "V1":  3100.0,  # Vs30 above which site effect = 0 (m/s)
+            "n1":  0.7,     # power-normal exponent (within-event residuals)
+            "n2":  0.25,    # power-normal exponent (total residuals)
+            "phi_S": 0.744,
+            "phi_P": 0.687,
+            "tau":   0.688,
+            "sigma": 1.466,
+        },
+        "interface": {
+            "c1":  5.268,   # source amplitude at Mth
+            "c2":  0.275,   # magnitude scaling (fixed to anchor Maule & Tohoku)
+            "d1":  None,    # not used (single exponential for interface)
+            "M0":  None,    # not used
+            "Mth": 7.000,   # reference magnitude for source term
+            "c31": 0.031,   # bilinear path slope (R <= R1)
+            "c32": 0.029,   # bilinear path slope (R > R1)
+            "R1":  250.0,   # path breakpoint distance (km)
+            "V1":  3100.0,  # Vs30 above which site effect = 0 (m/s)
+            "n1":  0.7,
+            "n2":  0.15,
+            "phi_S": 0.756,
+            "phi_P": 0.671,
+            "tau":   0.827,
+            "sigma": 1.665,
+        },
+    }
+
+    # ── Table 2: Regionalized coefficients (c3: distance slope, c4: site scaling)
+    # Note: interface Taiwan excluded. For other regions use Japan + 10% epistemic.
+    coeffs_regional = {
+        "slab": {
+            "JP": {"c3": 0.046, "c4": -1.480},
+            "NZ": {"c3": 0.032, "c4": -1.252},
+            "SA": {"c3": 0.042, "c4": -1.510},
+            "TW": {"c3": 0.038, "c4": -1.151},
+        },
+        "interface": {
+            "JP": {"c3": 0.030, "c4": -2.485},
+            "NZ": {"c3": 0.024, "c4": -2.420},
+            "SA": {"c3": 0.024, "c4": -2.248},
+            # TW excluded for interface
+        },
+    }
+
+    # ── Table 3: Standard deviation model coefficients (Eq. 9)
+    # sigma(s^n2) = a0 + a1*(R/100) + a2*(R/100)^2 + b1*M + b2*M^2 + c1*ln(Vs30)
+    sigma_coeffs = {
+        "slab": {
+            "a0":  0.3035,
+            "a1": -0.0188,
+            "a2":  0.0040,
+            "b1": -0.0288,
+            "b2":  0.0019,
+            "c1":  0.0038,
+        },
+        "interface": {
+            "a0":  0.3107,
+            "a1": -0.0393,
+            "a2":  0.0062,
+            "b1": -0.0519,
+            "b2":  0.0041,
+            "c1":  0.0028,
+        },
+    }
+
+    # Correlation between lnPGA and D5-75 epsilons
+    rho_pga_dur = {
+        "slab":      -0.376,
+        "interface": -0.539,
+    }
+
+    # V3: reference Vs30 for site term (zero-crossing point, ~800 m/s rock)
+    V3 = 800.0
+
+    # ── Input validation ──────────────────────────────────────────────────────
+    event_type = event_type.lower()
+    region = region.upper()
+
+    if event_type not in ("interface", "slab"):
+        raise ValueError("event_type must be 'interface' or 'slab'")
+    if event_type == "interface" and region == "TW":
+        raise ValueError("Taiwan (TW) is excluded from the interface model. Use JP, NZ, or SA.")
+    if region not in coeffs_regional[event_type]:
+        raise ValueError(
+            f"Region '{region}' not available for {event_type}. "
+            f"Valid: {list(coeffs_regional[event_type].keys())}. "
+            f"For Cascadia/US use region='JP' with epistemic_other_region=True."
+        )
+
+    c   = coeffs_global[event_type]
+    c3  = coeffs_regional[event_type][region]["c3"]
+    c4  = coeffs_regional[event_type][region]["c4"]
+    n2  = c["n2"]
+    V1  = c["V1"]
+    R1  = c["R1"]
+    sc  = sigma_coeffs[event_type]
+
+    # ── Source term Dsource(M) ────────────────────────────────────────────────
+    # Interface: single exponential  Dsource = c1 * 10^(c2 * (M - Mth))
+    # Slab:      two-part model
+    #   M <= Mth: Dsource = c1 * 10^(c2 * (M - M0))
+    #   M >  Mth: Dsource = c1 * 10^(c2*(Mth-M0)) + d1*(M-Mth)/(8.5-Mth)
+    if event_type == "interface":
+        D_source = c["c1"] * 10 ** (c["c2"] * (M - c["Mth"]))
+    else:
+        if M <= c["Mth"]:
+            D_source = c["c1"] * 10 ** (c["c2"] * (M - c["M0"]))
+        else:
+            base     = c["c1"] * 10 ** (c["c2"] * (c["Mth"] - c["M0"]))
+            D_source = base + c["d1"] * (M - c["Mth"]) / (8.5 - c["Mth"])
+
+    # ── Path term Dpath(Rrup) ─────────────────────────────────────────────────
+    # Dpath = c3(reg)*Rrup + f_path(Rrup)   [Eq. 5, median ΔP=1]
+    # f_path = c31*Rrup           for Rrup <= R1
+    #        = c31*R1 + (Rrup-R1)*c32   for Rrup > R1
+    if Rrup <= R1:
+        f_path = c["c31"] * Rrup
+    else:
+        f_path = c["c31"] * R1 + (Rrup - R1) * c["c32"]
+    D_path = c3 * Rrup + f_path
+
+    # ── Site term Dsite(Vs30) ─────────────────────────────────────────────────
+    # Dsite = c4(reg) * ln(Vs30 / V3)   for Vs30 <= V1
+    #       = 0                           for Vs30 > V1
+    D_site = 0.0 if Vs30 > V1 else c4 * np.log(Vs30 / V3)
+
+    # ── Median duration (Eq. 11) ──────────────────────────────────────────────
+    mu_median_s = D_source + D_path + D_site
+
+    # ── Standard deviation sigma(s^n2) (Eq. 9, Table 3) ──────────────────────
+    R100  = Rrup / 100.0
+    sigma = (sc["a0"]
+             + sc["a1"] * R100
+             + sc["a2"] * R100**2
+             + sc["b1"] * M
+             + sc["b2"] * M**2
+             + sc["c1"] * np.log(Vs30))
+
+    # ── Percentiles using power-normal distribution (Eq. 10) ─────────────────
+    mu_n2     = mu_median_s ** n2
+    D575_16th = max(0.0, mu_n2 - sigma) ** (1.0 / n2)
+    D575_84th = (mu_n2 + sigma) ** (1.0 / n2)
+
+    # ── Equivalent lognormal standard deviation ──────────────────────────────
+    # sigma is defined for D^n2, so it is converted to ln units via the 16th/84th
+    # percentiles; the epistemic term (ln units) is then added in ln space
+    sigma_ln = (np.log(D575_84th) - np.log(D575_16th)) / 2.0
+    if epistemic_other_region:
+        sigma_ln = np.sqrt(sigma_ln**2 + 0.10**2)
+
+    return {
+        "D575_median_s":  mu_median_s,
+        "sigma_total":    sigma,
+        "sigma_ln":       sigma_ln,
+        "D575_16th_s":    D575_16th,
+        "D575_84th_s":    D575_84th,
+        "n2":             n2,
+        "components": {
+            "Dsource_s": D_source,
+            "Dpath_s":   D_path,
+            "Dsite_s":   D_site,
+        },
+        "rho_PGA_dur": rho_pga_dur[event_type],
+    }

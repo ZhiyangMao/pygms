@@ -14,7 +14,7 @@ AVAIL_IMG = ['SA','DS575','DS595']
 
 
 class TargetIntensityMeasure:
-    def __init__(self,tgt_im_config):
+    def __init__(self,tgt_im_config,user_defined_spectra=None):
         """
         Input:
         - tgt_im_config: configuration dictionary with following attributes
@@ -23,6 +23,7 @@ class TargetIntensityMeasure:
         -- IntensityMeasureType: a list of intensity measure types, e.g., ['SA','DS575']
         -- Hazard: a dictionary including hazard information
         -- GroundMotionModel: a dictionary defining the ground motion model for individual intensity measures
+        - user_defined_spectra: optional dictionary {'mean': [...], 'std': [...]} (ln units) replacing the SA ground motion model
         """
         # target type
         self.tgt_type = tgt_im_config.get('TargetType',None)
@@ -53,6 +54,7 @@ class TargetIntensityMeasure:
                 # conditional value
                 self.cond_imv = cond_im.get(self.cond_imt).get('Value')
 
+        self.user_defined_spectra = user_defined_spectra
         # kz-250722: csv file input for periods
         self.filedirs = tgt_im_config.get('Directories',None)
         if self.filedirs is not None:
@@ -69,7 +71,7 @@ class TargetIntensityMeasure:
                 print('TargetIntensityMeasure.__init__: ERROR - the TargetIntensityMeasure input directory {} not found.'.format(self.input_dir))
                 return
         if self.output_dir is not None:
-            if os.path.isdir(self.output_dir):
+            if not os.path.isdir(self.output_dir):
                 os.makedirs(self.output_dir)
                 print('TargetIntensityMeasure.__init__: MESSAGE - the TargetIntensityMeasure output directory {} created.'.format(self.output_dir))
                 
@@ -169,6 +171,12 @@ class TargetIntensityMeasure:
         self.zhyp = self.hazard_info.get('Zhyp',None)
         self.z1p0 = self.hazard_info.get('Z1p0',None)
         self.z2p5 = self.hazard_info.get('Z2p5',None)
+        # subduction event type ('interface' or 'intraslab') and region for subduction duration models
+        self.event_type = self.hazard_info.get('EventType','interface').lower()
+        if self.event_type not in ['interface','intraslab']:
+            print('TargetIntensityMeasure: EventType should be interface or intraslab.')
+            return
+        self.region = self.hazard_info.get('Region','JP')
     
 
     def __gmm_config(self):
@@ -201,6 +209,8 @@ class TargetIntensityMeasure:
                 cur_calculator = SignificantDurationModel.bommer_stafford_alarcon_ds_2009
             elif cur_gmm == "Afshari & Stewart (2016)":
                 cur_calculator = SignificantDurationModel.afshari_stewart_ds_2016
+            elif cur_gmm in ["Pinilla-Ramos & Abrahamson (2025)", "PA25"]:
+                cur_calculator = SignificantDurationModel.pinilla_ramos_abrahamson_ds_2025
             else:
                 cur_calculator = USGSHazardGMM.USGS_GMM(cur_gmm, self.magnitude, self.vs30, imt=cur_imt, periods=cur_periods, rrup=self.rrup, 
                                                         rjb=self.rjb, rx=self.rx, dip=self.dip, width=self.width, ztop=self.ztop, 
@@ -229,6 +239,19 @@ class TargetIntensityMeasure:
                 # collect
                 im_mean.append(float(theta))
                 im_std.append(float(beta_tot))
+            elif cur_gmm in ["Pinilla-Ramos & Abrahamson (2025)", "PA25"]:
+                if cur_imt != 'DS575':
+                    print('TargetIntensityMeasure.run_im_calculator: Pinilla-Ramos & Abrahamson (2025) only supports DS575.')
+                    return
+                result = cur_calculator(M=self.magnitude, Rrup=self.rrup, Vs30=self.vs30,
+                                        event_type='interface' if self.event_type == 'interface' else 'slab',
+                                        region=self.region, epistemic_other_region=True)
+                # the model is power-normal, so the equivalent ln-unit sigma is used
+                im_mean.append(float(np.log(result['D575_median_s'])))
+                im_std.append(float(result['sigma_ln']))
+            elif cur_imt == 'SA' and self.user_defined_spectra is not None:
+                im_mean = im_mean+list(self.user_defined_spectra['mean'])
+                im_std = im_std+list(self.user_defined_spectra['std'])
             else:
                 cur_calculator.fetch_data()
                 theta = np.log(cur_calculator.im['Median']).tolist()
@@ -322,6 +345,20 @@ class GroundMotionSelection:
                 "Vs30": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/Preferred Vs30 (m-s).csv'),
                 "Distance": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/EpiD (km).csv')
             }
+        elif self.gmdb_file in ['NGA-Sub-Interface', 'NGA-Sub-Intraslab']:
+            # H1 and H2 components stored as separate records; SA split into xz-compressed chunks
+            cur_dir = os.path.join(os.path.dirname(__file__),'gmdb','nga_sub_{}'.format(self.gmdb_file.split('-')[-1].lower()))
+            n_chunk = len([x for x in os.listdir(cur_dir) if x.startswith('psa_p') and x.endswith('.csv.xz')])
+            self.gmdb_file = {
+                "SA": [os.path.join(cur_dir,'psa_p{}.csv.xz'.format(i)) for i in range(1,n_chunk+1)],
+                "Periods": os.path.join(cur_dir,'period.csv'),
+                "DS575": os.path.join(cur_dir,'ds575.csv'),
+                "DS595": os.path.join(cur_dir,'ds595.csv'),
+                "Filename": os.path.join(cur_dir,'filename.csv'),
+                "Magnitude": os.path.join(cur_dir,'Earthquake Magnitude.csv'),
+                "Vs30": os.path.join(cur_dir,'Preferred Vs30 (m-s).csv'),
+                "Distance": os.path.join(cur_dir,'EpiD (km).csv')
+            }
         self.gmdb = dict()
         self.gmdb_status = False
         # error weight
@@ -337,14 +374,19 @@ class GroundMotionSelection:
     def __load_gmdb(self, ims, cond_imv, cond_idx):
         # load the ground motion database
         for cur_key, cur_db_filename in self.gmdb_file.items():
+            # SA is read as float32 to halve memory for large databases (e.g., NGA-West3)
+            cur_dtype = np.float32 if cur_key == 'SA' else None
             if isinstance(cur_db_filename,list):
-                cur_db = pd.DataFrame()
-                for cur_file in cur_db_filename:
-                    tmp = pd.read_csv(cur_file,index_col=False,header=None)
-                    cur_db = pd.concat([cur_db, tmp], ignore_index=True)
+                cur_db = pd.concat([pd.read_csv(cur_file,index_col=False,header=None,dtype=cur_dtype) for cur_file in cur_db_filename],
+                                   ignore_index=True)
             else:
-                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None)
+                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None,dtype=cur_dtype)
             self.gmdb.update({cur_key: cur_db})
+        # check that all record-wise tables are aligned with SA
+        for cur_key, cur_db in self.gmdb.items():
+            if cur_key != 'Periods' and len(cur_db) != len(self.gmdb['SA']):
+                raise ValueError('GroundMotionSelection.__load_gmdb: {} has {} rows but SA has {} rows.'.format(
+                    cur_key, len(cur_db), len(self.gmdb['SA'])))
         self.gmdb_periods = self.gmdb.get('Periods').to_numpy().flatten().tolist()
         self.gmdb_imv = self.gmdb['SA'].to_numpy()
 
@@ -389,6 +431,14 @@ class GroundMotionSelection:
                         if self.distance_min <= cur_distance <= self.distance_max:
                             count_after_distance += 1
                             self.gm_flag.append(gmid)
+        # exclude records with missing (non-positive) durations when durations are targeted
+        count_missing_duration = 0
+        for cur_im in ims:
+            if cur_im.startswith('DS575') or cur_im.startswith('DS595'):
+                cur_ds = self.gmdb[cur_im[:5]].to_numpy().flatten()
+                count_before = len(self.gm_flag)
+                self.gm_flag = [x for x in self.gm_flag if cur_ds[x] > 0]
+                count_missing_duration += count_before - len(self.gm_flag)
         self.gm_sf = np.array([self.gm_scaling[x] for x in self.gm_flag])
         self.gmdb_imv = np.log(self.gmdb_imv[self.gm_flag,:]*self.gm_sf[:,np.newaxis])
         # end of modification
@@ -398,15 +448,17 @@ class GroundMotionSelection:
         print(f"After magnitude filter: {count_after_magnitude}")
         print(f"After Vs30 filter: {count_after_vs30}")
         print(f"After distance filter: {count_after_distance}")
+        if count_missing_duration > 0:
+            print(f"Removed for missing duration: {count_missing_duration}")
         print(f"Final accepted samples: {len(self.gmdb_imv)}")
         # end of addition
         for cur_im in ims:
             if cur_im.startswith('DS575'):
-                tmp = np.log(self.gmdb['DS575'].to_numpy())
-                self.gmdb_imv = np.concatenate((self.gmdb_imv, tmp[self.gm_flag,:]), axis=1)
+                tmp = np.log(self.gmdb['DS575'].to_numpy()[self.gm_flag,:])
+                self.gmdb_imv = np.concatenate((self.gmdb_imv, tmp), axis=1)
             elif cur_im.startswith('DS595'):
-                tmp = np.log(self.gmdb['DS595'].to_numpy())
-                self.gmdb_imv = np.concatenate((self.gmdb_imv, tmp[self.gm_flag,:]), axis=1)
+                tmp = np.log(self.gmdb['DS595'].to_numpy()[self.gm_flag,:])
+                self.gmdb_imv = np.concatenate((self.gmdb_imv, tmp), axis=1)
             else:
                 pass    
         self.gmdb_status = True
@@ -530,9 +582,15 @@ class GroundMotionSelection:
 
 
     def export_selection(self, ims, output_dir=None):
+        # output_dir can be None (default location), a directory, or a full .csv file path
         if output_dir is None:
             output_dir = os.path.dirname(__file__)
+        if output_dir.lower().endswith('.csv'):
+            output_path = output_dir
+        else:
             output_path = os.path.join(output_dir,'GroundMotionSelectionResults.csv')
+        if os.path.dirname(output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
         # ground motion names
         self.selected_gm_names = self.gmdb['Filename'].iloc[[self.gm_flag[x] for x in self.selected_id],0].to_list()
         # intensity measures
@@ -607,7 +665,7 @@ def conditional_intensity_measure(im_mean,im_std,im_corr,im_cond_idx,im_cond):
     return cmim, cov_cond
 
 # adding back the run_selection in pygms for batch run (kz)
-def run_selection(gms_config):
+def run_selection(gms_config,out_dir=None):
     with open(gms_config,'r') as f:
         job_config = json.load(f)
 
@@ -624,4 +682,4 @@ def run_selection(gms_config):
     my_gms.initial_scanning(my_tgt.ims,my_tgt.cond_imv,my_tgt.cond_im_idx)
     my_gms.optimize_selection(my_tgt.ims)
 
-    my_gms.export_selection(my_tgt.ims)
+    my_gms.export_selection(my_tgt.ims,out_dir)
