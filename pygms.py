@@ -69,7 +69,7 @@ class TargetIntensityMeasure:
                 print('TargetIntensityMeasure.__init__: ERROR - the TargetIntensityMeasure input directory {} not found.'.format(self.input_dir))
                 return
         if self.output_dir is not None:
-            if os.path.isdir(self.output_dir):
+            if not os.path.isdir(self.output_dir):
                 os.makedirs(self.output_dir)
                 print('TargetIntensityMeasure.__init__: MESSAGE - the TargetIntensityMeasure output directory {} created.'.format(self.output_dir))
                 
@@ -322,6 +322,18 @@ class GroundMotionSelection:
                 "Vs30": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/Preferred Vs30 (m-s).csv'),
                 "Distance": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/EpiD (km).csv')
             }
+        elif self.gmdb_file == 'NGA-West3':
+            # H1 and H2 components stacked as separate records; SA split into xz-compressed chunks
+            self.gmdb_file = {
+                "SA": [os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/psa_p{}.csv.xz'.format(i)) for i in range(1,10)],
+                "Periods": os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/period.csv'),
+                "DS575": os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/ds575.csv'),
+                "DS595": os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/ds595.csv'),
+                "Filename": os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/filename.csv'),
+                "Magnitude": os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/Earthquake Magnitude.csv'),
+                "Vs30": os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/Preferred Vs30 (m-s).csv'),
+                "Distance": os.path.join(os.path.dirname(__file__),'gmdb/nga_west3/EpiD (km).csv')
+            }
         self.gmdb = dict()
         self.gmdb_status = False
         # error weight
@@ -337,14 +349,19 @@ class GroundMotionSelection:
     def __load_gmdb(self, ims, cond_imv, cond_idx):
         # load the ground motion database
         for cur_key, cur_db_filename in self.gmdb_file.items():
+            # SA is read as float32 to halve memory for large databases (e.g., NGA-West3)
+            cur_dtype = np.float32 if cur_key == 'SA' else None
             if isinstance(cur_db_filename,list):
-                cur_db = pd.DataFrame()
-                for cur_file in cur_db_filename:
-                    tmp = pd.read_csv(cur_file,index_col=False,header=None)
-                    cur_db = pd.concat([cur_db, tmp], ignore_index=True)
+                cur_db = pd.concat([pd.read_csv(cur_file,index_col=False,header=None,dtype=cur_dtype) for cur_file in cur_db_filename],
+                                   ignore_index=True)
             else:
-                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None)
+                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None,dtype=cur_dtype)
             self.gmdb.update({cur_key: cur_db})
+        # check that all record-wise tables are aligned with SA
+        for cur_key, cur_db in self.gmdb.items():
+            if cur_key != 'Periods' and len(cur_db) != len(self.gmdb['SA']):
+                raise ValueError('GroundMotionSelection.__load_gmdb: {} has {} rows but SA has {} rows.'.format(
+                    cur_key, len(cur_db), len(self.gmdb['SA'])))
         self.gmdb_periods = self.gmdb.get('Periods').to_numpy().flatten().tolist()
         self.gmdb_imv = self.gmdb['SA'].to_numpy()
 
@@ -530,9 +547,15 @@ class GroundMotionSelection:
 
 
     def export_selection(self, ims, output_dir=None):
+        # output_dir can be None (default location), a directory, or a full .csv file path
         if output_dir is None:
             output_dir = os.path.dirname(__file__)
+        if output_dir.lower().endswith('.csv'):
+            output_path = output_dir
+        else:
             output_path = os.path.join(output_dir,'GroundMotionSelectionResults.csv')
+        if os.path.dirname(output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
         # ground motion names
         self.selected_gm_names = self.gmdb['Filename'].iloc[[self.gm_flag[x] for x in self.selected_id],0].to_list()
         # intensity measures
@@ -607,7 +630,7 @@ def conditional_intensity_measure(im_mean,im_std,im_corr,im_cond_idx,im_cond):
     return cmim, cov_cond
 
 # adding back the run_selection in pygms for batch run (kz)
-def run_selection(gms_config):
+def run_selection(gms_config,out_dir=None):
     with open(gms_config,'r') as f:
         job_config = json.load(f)
 
@@ -624,4 +647,4 @@ def run_selection(gms_config):
     my_gms.initial_scanning(my_tgt.ims,my_tgt.cond_imv,my_tgt.cond_im_idx)
     my_gms.optimize_selection(my_tgt.ims)
 
-    my_gms.export_selection(my_tgt.ims)
+    my_gms.export_selection(my_tgt.ims,out_dir)

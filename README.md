@@ -15,6 +15,7 @@ The implementation provides a user-friendly interface through JSON configuration
 - Integration with USGS hazard API for ground motion prediction equations
 - Built-in significant duration models
 - Includes dataset of NGA-West ground motions (Sa from 0.01s to 10s, Ds5-75, and Ds5-95)
+- Includes dataset of NGA-West3 ground motions (H1 and H2 components, Sa from 0.01s to 10s, Ds5-75, and Ds5-95)
 
 ## Structure
 
@@ -41,7 +42,24 @@ import pygms
 
 # Load configuration from JSON file
 pygms.run_selection("example1.json")
+
+# Optionally specify the output file (or directory)
+pygms.run_selection("example1.json", "results/example1.csv")
 ```
+
+### Ground Motion Databases
+
+The database is selected by the `Database` field in the `GroundMotionSelection` section of the JSON configuration file:
+
+| `Database` | Description | Location |
+|---|---|---|
+| `null` | NGA-West subset (default) | `gmdb/nga_west_*.csv` |
+| `"NGA-West2"` | NGA-West2 | `gmdb/nga_west2/` |
+| `"NGA-West3"` | NGA-West3, H1 and H2 components stored as separate records | `gmdb/nga_west3/` |
+
+Notes on the NGA-West3 database:
+- The spectral acceleration table is stored with 5 significant digits and split into xz-compressed chunks (`psa_p1.csv.xz` to `psa_p9.csv.xz`) to meet the GitHub file size limit. The chunks are read and concatenated automatically.
+- Loading the full database takes about 1 minute and about 3 GB of memory.
 
 ## Configuration Options
 
@@ -59,6 +77,8 @@ The package includes three example configurations:
 2. **example2.json**: CS only target
 3. **example3.json**: CMS only target
 
+To use the NGA-West3 database in any example, set `"Database": "NGA-West3"`.
+
 ## Selection Algorithm
 
 The ground motion selection algorithm follows these steps:
@@ -72,7 +92,7 @@ The ground motion selection algorithm follows these steps:
 ## Output
 
 The default output is a CSV file containing:
-1. Ground motion filenames (RSN identifiers)
+1. Ground motion filenames (RSN identifiers; for NGA-West3, `<RecordID>_<H1/H2>_<Earthquake Name>`)
 2. Unscaled spectra values
 3. Significant duration values
 4. Scaling factors
@@ -91,6 +111,7 @@ Baker, J. W., and Lee, C. (2018). “[An Improved Algorithm for Selecting Ground
 - Kuanshi Zhong (Implementation in Python)
 - Jack Baker (Development of a previous implementation in Matlab)
 - Marguerite Dubertret (Performance and functional improvements)
+- Zhiyang Mao (NGA-West3 database integration)
 
 ## Contact
 

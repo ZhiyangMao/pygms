@@ -71,10 +71,10 @@
     }
   },
   "GroundMotionSelection": {
-    "RecordNum": 5,
+    "RecordNum": 50,
     "Scaling": {
       "Min": 0.1,
-      "Max": 20
+      "Max": 5
     },
     "Database": null,
     "ErrorWeight": {
