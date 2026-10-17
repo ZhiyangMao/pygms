@@ -13,6 +13,7 @@ The implementation provides a user-friendly interface through JSON configuration
   - Conditional Mean Spectrum (CMS)
   - Conditional Spectrum plus duration constraints (CS+duration)
 - Integration with USGS hazard API for ground motion prediction equations
+- User-defined target spectra (e.g., a weighted average of several ground motion models) in place of a single ground motion model
 - Built-in significant duration models
 - Includes dataset of NGA-West ground motions (Sa from 0.01s to 10s, Ds5-75, and Ds5-95)
 
@@ -41,7 +42,37 @@ import pygms
 
 # Load configuration from JSON file
 pygms.run_selection("example1.json")
+
+# Optionally specify the output file (or directory)
+pygms.run_selection("example1.json", "results/example1.csv")
 ```
+
+### User-Defined Target Spectrum
+
+The SA ground motion model can be replaced by a user-defined spectrum, for example a weighted average of several ground motion models. In the JSON configuration, point `GroundMotionModel.SA` to a CSV file (relative to `Directories.Input`):
+
+```json
+"Directories": {"Input": "./input"},
+"GroundMotionModel": {
+  "SA": {"UserDefined": "user_defined_spectrum.csv"},
+  "DS575": "Afshari & Stewart (2016)"
+}
+```
+
+The CSV file has three columns:
+
+| Column | Description |
+|---|---|
+| `Period` | Period (s) |
+| `Median` | Median Sa (g) |
+| `Dispersion` | Standard deviation of ln Sa |
+
+- The spectrum must be **unconditional** (e.g., ground motion model medians and dispersions). PyGMS conditions it on the conditional intensity measure in the same way as ground motion model outputs, so a conditional spectrum (e.g., a precomputed CMS) should not be used here.
+- ln(Median) and Dispersion are interpolated linearly in ln(T) to the SA periods; the SA periods must lie within the period range of the file.
+- The same input can be passed in Python as `TargetIntensityMeasure(config, user_defined_spectra={'Period': [...], 'Median': [...], 'Dispersion': [...]})`, or as `{'mean': [...], 'std': [...]}` in ln units aligned with the SA periods.
+- Duration targets still use the duration model in `GroundMotionModel`.
+
+The example spectrum `input/user_defined_spectrum.csv` is the equal-weight average of ASK14, BSSA14, CB14, and CY14 for the scenario in `example1.json` (mean of ln medians; dispersion including the between-model variance).
 
 ## Configuration Options
 
@@ -58,6 +89,7 @@ The package includes three example configurations:
 1. **example1.json**: CS+duration target
 2. **example2.json**: CS only target
 3. **example3.json**: CMS only target
+4. **example_user_defined_target.json**: CS+duration target with a user-defined SA spectrum (`input/user_defined_spectrum.csv`)
 
 ## Selection Algorithm
 
@@ -91,6 +123,7 @@ Baker, J. W., and Lee, C. (2018). “[An Improved Algorithm for Selecting Ground
 - Kuanshi Zhong (Implementation in Python)
 - Jack Baker (Development of a previous implementation in Matlab)
 - Marguerite Dubertret (Performance and functional improvements)
+- Zhiyang Mao (User-defined target spectrum)
 
 ## Contact
 

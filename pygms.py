@@ -14,7 +14,7 @@ AVAIL_IMG = ['SA','DS575','DS595']
 
 
 class TargetIntensityMeasure:
-    def __init__(self,tgt_im_config):
+    def __init__(self,tgt_im_config,user_defined_spectra=None):
         """
         Input:
         - tgt_im_config: configuration dictionary with following attributes
@@ -22,7 +22,12 @@ class TargetIntensityMeasure:
            'CMS' (conditional mean spectrum), 'CS' (conditional spectrum), 'CSD' (conditional spectrum & duration)
         -- IntensityMeasureType: a list of intensity measure types, e.g., ['SA','DS575']
         -- Hazard: a dictionary including hazard information
-        -- GroundMotionModel: a dictionary defining the ground motion model for individual intensity measures
+        -- GroundMotionModel: a dictionary defining the ground motion model for individual intensity measures;
+           for SA, {"UserDefined": "<csv file>"} replaces the ground motion model by a user-defined spectrum
+        - user_defined_spectra: optional dictionary replacing the SA ground motion model, either
+          {'Period': [...], 'Median': [...], 'Dispersion': [...]} (Median in g, Dispersion = std of ln Sa) or
+          {'mean': [...], 'std': [...]} (ln units, aligned with the SA periods)
+        The user-defined spectrum must be unconditional; it is conditioned on the conditional IM like GMM outputs.
         """
         # target type
         self.tgt_type = tgt_im_config.get('TargetType',None)
@@ -69,7 +74,7 @@ class TargetIntensityMeasure:
                 print('TargetIntensityMeasure.__init__: ERROR - the TargetIntensityMeasure input directory {} not found.'.format(self.input_dir))
                 return
         if self.output_dir is not None:
-            if os.path.isdir(self.output_dir):
+            if not os.path.isdir(self.output_dir):
                 os.makedirs(self.output_dir)
                 print('TargetIntensityMeasure.__init__: MESSAGE - the TargetIntensityMeasure output directory {} created.'.format(self.output_dir))
                 
@@ -93,6 +98,9 @@ class TargetIntensityMeasure:
             print('TargetIntensityMeasure.__init__: please define GroundMotionModel.')
             return
         self.__gmm_config()
+
+        # configure user-defined SA spectrum (replacing the SA ground motion model)
+        self.__user_defined_sa_config(user_defined_spectra)
 
         # configure intensity measure calculators
         self.set_im_calculator()
@@ -184,6 +192,52 @@ class TargetIntensityMeasure:
             self.gmm.update({cur_im: cur_prop})
     
 
+    def __user_defined_sa_config(self, user_defined_spectra=None):
+        """
+        Configure the user-defined SA spectrum (unconditional ln-mean and standard deviation at the SA periods)
+        """
+        self.user_sa = None
+        sa_gmm = self.gmm_info.get('SA', None)
+        if user_defined_spectra is None and isinstance(sa_gmm, dict) and 'UserDefined' in sa_gmm:
+            # load the spectrum file (relative to the input directory, if defined)
+            spectrum_file = sa_gmm['UserDefined']
+            if self.input_dir is not None and not os.path.isabs(spectrum_file):
+                spectrum_file = os.path.join(self.input_dir, spectrum_file)
+            if not os.path.isfile(spectrum_file):
+                raise FileNotFoundError('TargetIntensityMeasure: user-defined spectrum file {} not found.'.format(spectrum_file))
+            user_defined_spectra = pd.read_csv(spectrum_file).to_dict(orient='list')
+        if user_defined_spectra is None:
+            return
+        if 'SA' not in self.imt:
+            raise ValueError('TargetIntensityMeasure: a user-defined spectrum is given but SA is not an intensity measure.')
+        num_periods = len(self.sa_periods)
+        if 'mean' in user_defined_spectra:
+            # ln-mean and standard deviation already aligned with the SA periods
+            sa_mean = np.array(user_defined_spectra['mean'], dtype=float).flatten()
+            sa_std = np.array(user_defined_spectra['std'], dtype=float).flatten()
+            if len(sa_mean) != num_periods or len(sa_std) != num_periods:
+                raise ValueError('TargetIntensityMeasure: user-defined mean/std have {}/{} values but there are {} SA periods.'.format(
+                    len(sa_mean), len(sa_std), num_periods))
+        else:
+            # spectrum table: interpolate ln(Median) and Dispersion linearly in ln(T) to the SA periods
+            table = pd.DataFrame({k: np.array(user_defined_spectra[k], dtype=float).flatten() for k in ['Period','Median','Dispersion']})
+            table = table.sort_values('Period')
+            if (table['Period'] <= 0).any() or (table['Median'] <= 0).any() or (table['Dispersion'] < 0).any():
+                raise ValueError('TargetIntensityMeasure: user-defined Period and Median must be positive and Dispersion non-negative.')
+            sa_periods = np.array(self.sa_periods, dtype=float)
+            t_min, t_max = table['Period'].min(), table['Period'].max()
+            if sa_periods.min() < t_min*(1-1e-9) or sa_periods.max() > t_max*(1+1e-9):
+                raise ValueError('TargetIntensityMeasure: SA periods ({:g}-{:g} s) exceed the user-defined spectrum ({:g}-{:g} s).'.format(
+                    sa_periods.min(), sa_periods.max(), t_min, t_max))
+            ln_t = np.log(table['Period'].to_numpy())
+            sa_mean = np.interp(np.log(sa_periods), ln_t, np.log(table['Median'].to_numpy()))
+            sa_std = np.interp(np.log(sa_periods), ln_t, table['Dispersion'].to_numpy())
+        if np.any(~np.isfinite(sa_mean)) or np.any(~np.isfinite(sa_std)) or np.any(sa_std < 0):
+            raise ValueError('TargetIntensityMeasure: invalid values in the user-defined spectrum.')
+        self.user_sa = {'mean': sa_mean.tolist(), 'std': sa_std.tolist()}
+        print('TargetIntensityMeasure: SA target from the user-defined spectrum ({} periods).'.format(num_periods))
+    
+
     def set_im_calculator(self):
         # loop over all imt
         self.im_calculators = dict()
@@ -193,6 +247,10 @@ class TargetIntensityMeasure:
                 cur_periods = self.sa_periods
             else:
                 cur_periods = cur_prop.get('Periods', None)
+            if cur_imt == 'SA' and self.user_sa is not None:
+                # user-defined spectrum, no ground motion model needed
+                self.im_calculators.update({cur_imt: None})
+                continue
             cur_gmm = self.gmm.get(cur_imt, None)
             if cur_gmm is None:
                 print('SiteData.compute_im: cannot find the ground motion model for {}'.format(cur_imt))
@@ -217,6 +275,10 @@ class TargetIntensityMeasure:
         for cur_imt, cur_prop in self.imt.items():
             cur_calculator = self.im_calculators.get(cur_imt)
             cur_gmm = self.gmm.get(cur_imt, None)
+            if cur_imt == 'SA' and self.user_sa is not None:
+                im_mean = im_mean+self.user_sa['mean']
+                im_std = im_std+self.user_sa['std']
+                continue
             if cur_gmm == "Bommer, Stafford & Alarcon (2009)":
                 theta, beta_tot, beta_tau, beta_phi = cur_calculator(magnitude=self.magnitude, distance=self.rrup, 
                                                                      vs30=self.vs30, duration_type=cur_imt+'H')
@@ -337,14 +399,19 @@ class GroundMotionSelection:
     def __load_gmdb(self, ims, cond_imv, cond_idx):
         # load the ground motion database
         for cur_key, cur_db_filename in self.gmdb_file.items():
+            # SA is read as float32 to halve memory for large databases (e.g., NGA-West3)
+            cur_dtype = np.float32 if cur_key == 'SA' else None
             if isinstance(cur_db_filename,list):
-                cur_db = pd.DataFrame()
-                for cur_file in cur_db_filename:
-                    tmp = pd.read_csv(cur_file,index_col=False,header=None)
-                    cur_db = pd.concat([cur_db, tmp], ignore_index=True)
+                cur_db = pd.concat([pd.read_csv(cur_file,index_col=False,header=None,dtype=cur_dtype) for cur_file in cur_db_filename],
+                                   ignore_index=True)
             else:
-                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None)
+                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None,dtype=cur_dtype)
             self.gmdb.update({cur_key: cur_db})
+        # check that all record-wise tables are aligned with SA
+        for cur_key, cur_db in self.gmdb.items():
+            if cur_key != 'Periods' and len(cur_db) != len(self.gmdb['SA']):
+                raise ValueError('GroundMotionSelection.__load_gmdb: {} has {} rows but SA has {} rows.'.format(
+                    cur_key, len(cur_db), len(self.gmdb['SA'])))
         self.gmdb_periods = self.gmdb.get('Periods').to_numpy().flatten().tolist()
         self.gmdb_imv = self.gmdb['SA'].to_numpy()
 
@@ -530,9 +597,15 @@ class GroundMotionSelection:
 
 
     def export_selection(self, ims, output_dir=None):
+        # output_dir can be None (default location), a directory, or a full .csv file path
         if output_dir is None:
             output_dir = os.path.dirname(__file__)
+        if output_dir.lower().endswith('.csv'):
+            output_path = output_dir
+        else:
             output_path = os.path.join(output_dir,'GroundMotionSelectionResults.csv')
+        if os.path.dirname(output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
         # ground motion names
         self.selected_gm_names = self.gmdb['Filename'].iloc[[self.gm_flag[x] for x in self.selected_id],0].to_list()
         # intensity measures
@@ -607,7 +680,7 @@ def conditional_intensity_measure(im_mean,im_std,im_corr,im_cond_idx,im_cond):
     return cmim, cov_cond
 
 # adding back the run_selection in pygms for batch run (kz)
-def run_selection(gms_config):
+def run_selection(gms_config,out_dir=None):
     with open(gms_config,'r') as f:
         job_config = json.load(f)
 
@@ -624,4 +697,4 @@ def run_selection(gms_config):
     my_gms.initial_scanning(my_tgt.ims,my_tgt.cond_imv,my_tgt.cond_im_idx)
     my_gms.optimize_selection(my_tgt.ims)
 
-    my_gms.export_selection(my_tgt.ims)
+    my_gms.export_selection(my_tgt.ims,out_dir)
