@@ -76,8 +76,7 @@ The package includes three example configurations:
 1. **example1.json**: CS+duration target
 2. **example2.json**: CS only target
 3. **example3.json**: CMS only target
-
-To use the NGA-West3 database in any example, set `"Database": "NGA-West3"`.
+4. **example_nga_west3.json**: CS+duration target with the NGA-West3 database
 
 ## Selection Algorithm
 
