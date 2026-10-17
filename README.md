@@ -98,8 +98,8 @@ The package includes three example configurations:
 1. **example1.json**: CS+duration target
 2. **example2.json**: CS only target
 3. **example3.json**: CMS only target
-4. **example4.json**: CS+duration target for a subduction interface scenario (NGA-Sub interface database)
-5. **example5.json**: CS+duration target for a subduction intraslab scenario (NGA-Sub intraslab database)
+4. **example_nga_sub_interface.json**: CS+duration target for a subduction interface scenario (NGA-Sub interface database)
+5. **example_nga_sub_intraslab.json**: CS+duration target for a subduction intraslab scenario (NGA-Sub intraslab database)
 
 ## Selection Algorithm
 

@@ -14,7 +14,7 @@ AVAIL_IMG = ['SA','DS575','DS595']
 
 
 class TargetIntensityMeasure:
-    def __init__(self,tgt_im_config,user_defined_spectra=None):
+    def __init__(self,tgt_im_config):
         """
         Input:
         - tgt_im_config: configuration dictionary with following attributes
@@ -23,7 +23,6 @@ class TargetIntensityMeasure:
         -- IntensityMeasureType: a list of intensity measure types, e.g., ['SA','DS575']
         -- Hazard: a dictionary including hazard information
         -- GroundMotionModel: a dictionary defining the ground motion model for individual intensity measures
-        - user_defined_spectra: optional dictionary {'mean': [...], 'std': [...]} (ln units) replacing the SA ground motion model
         """
         # target type
         self.tgt_type = tgt_im_config.get('TargetType',None)
@@ -54,7 +53,6 @@ class TargetIntensityMeasure:
                 # conditional value
                 self.cond_imv = cond_im.get(self.cond_imt).get('Value')
 
-        self.user_defined_spectra = user_defined_spectra
         # kz-250722: csv file input for periods
         self.filedirs = tgt_im_config.get('Directories',None)
         if self.filedirs is not None:
@@ -249,9 +247,6 @@ class TargetIntensityMeasure:
                 # the model is power-normal, so the equivalent ln-unit sigma is used
                 im_mean.append(float(np.log(result['D575_median_s'])))
                 im_std.append(float(result['sigma_ln']))
-            elif cur_imt == 'SA' and self.user_defined_spectra is not None:
-                im_mean = im_mean+list(self.user_defined_spectra['mean'])
-                im_std = im_std+list(self.user_defined_spectra['std'])
             else:
                 cur_calculator.fetch_data()
                 theta = np.log(cur_calculator.im['Median']).tolist()
