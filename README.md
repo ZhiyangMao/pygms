@@ -15,6 +15,7 @@ The implementation provides a user-friendly interface through JSON configuration
 - Integration with USGS hazard API for ground motion prediction equations
 - Built-in significant duration models
 - Includes dataset of NGA-West ground motions (Sa from 0.01s to 10s, Ds5-75, and Ds5-95)
+- Optional per-earthquake penalty to limit the number of records selected from the same event
 
 ## Structure
 
@@ -41,7 +42,31 @@ import pygms
 
 # Load configuration from JSON file
 pygms.run_selection("example1.json")
+
+# Optionally specify the output file (or directory)
+pygms.run_selection("example1.json", "results/example1.csv")
 ```
+
+### Limiting Records per Earthquake
+
+Large, well-recorded events (e.g., Chi-Chi) can dominate a selected set. An optional `EventPenalty` section in `GroundMotionSelection` limits the number of records taken from the same earthquake:
+
+```json
+"EventPenalty": {
+  "MaxPerEvent": 5,
+  "Weight": 1.0,
+  "Exponent": 2,
+  "Mode": "soft+hard"
+}
+```
+
+- `MaxPerEvent`: maximum number of records per earthquake (EQID). The penalty is disabled when `EventPenalty` is absent.
+- `SoftCap`: number of records per earthquake above which the soft penalty starts (default `MaxPerEvent`). With the default, up to `MaxPerEvent` records per earthquake are allowed without penalty. Set `SoftCap` below `MaxPerEvent` to further discourage earthquakes from approaching the cap.
+- `Weight`: penalty weight. The penalty is scaled by the initial fitting error, so values of order 1 work across sites and targets.
+- `Exponent`: the penalty for each earthquake is `max(0, n - SoftCap) ** Exponent`, where `n` is its number of selected records.
+- `Mode`: `"soft+hard"` (default), `"soft"` (penalty only), or `"hard"` (cap only).
+
+Earthquakes are identified by the NGA-West2 `EQID` from `gmdb/nga_west_event.csv` (default database) or `gmdb/nga_west2/event.csv` (`"NGA-West2"`), built from the NGA-West2 flatfile with `tools/build_event_table.py`. When the penalty is enabled, the output file includes `EQID` and `EarthquakeName` columns and a summary of records per earthquake is printed.
 
 ## Configuration Options
 
@@ -58,6 +83,7 @@ The package includes three example configurations:
 1. **example1.json**: CS+duration target
 2. **example2.json**: CS only target
 3. **example3.json**: CMS only target
+4. **example_event_penalty.json**: CS+duration target with at most 5 records per earthquake
 
 ## Selection Algorithm
 
@@ -91,6 +117,7 @@ Baker, J. W., and Lee, C. (2018). “[An Improved Algorithm for Selecting Ground
 - Kuanshi Zhong (Implementation in Python)
 - Jack Baker (Development of a previous implementation in Matlab)
 - Marguerite Dubertret (Performance and functional improvements)
+- Zhiyang Mao (Per-earthquake record penalty)
 
 ## Contact
 

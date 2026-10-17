@@ -69,7 +69,7 @@ class TargetIntensityMeasure:
                 print('TargetIntensityMeasure.__init__: ERROR - the TargetIntensityMeasure input directory {} not found.'.format(self.input_dir))
                 return
         if self.output_dir is not None:
-            if os.path.isdir(self.output_dir):
+            if not os.path.isdir(self.output_dir):
                 os.makedirs(self.output_dir)
                 print('TargetIntensityMeasure.__init__: MESSAGE - the TargetIntensityMeasure output directory {} created.'.format(self.output_dir))
                 
@@ -307,6 +307,7 @@ class GroundMotionSelection:
                 "Vs30": os.path.join(os.path.dirname(__file__),'gmdb/nga_west_Preferred Vs30 (m-s).csv'),
                 "Distance": os.path.join(os.path.dirname(__file__),'gmdb/nga_west_EpiD (km).csv'),
                 # end of addition
+                "EventID": os.path.join(os.path.dirname(__file__),'gmdb/nga_west_event.csv'),
             }
         elif self.gmdb_file == 'NGA-West2':
             self.gmdb_file = {
@@ -320,8 +321,13 @@ class GroundMotionSelection:
                 # added
                 "Magnitude": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/Earthquake Magnitude.csv'),
                 "Vs30": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/Preferred Vs30 (m-s).csv'),
-                "Distance": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/EpiD (km).csv')
+                "Distance": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/EpiD (km).csv'),
+                "EventID": os.path.join(os.path.dirname(__file__),'gmdb/nga_west2/event.csv')
             }
+        # added (zm): RSN->EQID lookup table (built from the NGA-West2 flatfile).
+        # Popped out of self.gmdb_file so the generic header=None loader never sees it.
+        self.event_file = self.gmdb_file.pop('EventID', None)
+        # end of addition
         self.gmdb = dict()
         self.gmdb_status = False
         # error weight
@@ -332,19 +338,44 @@ class GroundMotionSelection:
                 "DS575": [0.5, 0.5]
             }
         self.tgt_type = gms_config.get('TargetType')
+        # added (zm): per-event record-count penalty.
+        # Disabled entirely when 'EventPenalty' is absent, so old configs are unaffected.
+        ep = gms_config.get('EventPenalty',None) or {}
+        self.max_per_event = ep.get('MaxPerEvent',None)
+        self.event_penalty_on = self.max_per_event is not None
+        # Soft threshold: penalty starts accruing above SoftCap, the hard guard bites at
+        # MaxPerEvent. SoftCap defaults to MaxPerEvent so that up to MaxPerEvent records per
+        # event are allowed without penalty; set SoftCap < MaxPerEvent to discourage events
+        # from approaching the cap (in 'soft+hard' mode the soft term is otherwise inactive).
+        self.event_soft_cap = ep.get('SoftCap',None)
+        if self.event_penalty_on and self.event_soft_cap is None:
+            self.event_soft_cap = self.max_per_event
+        self.event_penalty_k = ep.get('Weight',1.0)
+        self.event_penalty_exp = ep.get('Exponent',2)
+        self.event_penalty_mode = ep.get('Mode','soft+hard')
+        self.event_guard_on = self.event_penalty_on and ('hard' in self.event_penalty_mode)
+        self.event_soft_on = self.event_penalty_on and ('soft' in self.event_penalty_mode)
+        self.gm_event_code = None
+        self.num_event = 0
+        # end of addition
     
 
     def __load_gmdb(self, ims, cond_imv, cond_idx):
         # load the ground motion database
         for cur_key, cur_db_filename in self.gmdb_file.items():
+            # SA is read as float32 to halve memory for large databases (e.g., NGA-West3)
+            cur_dtype = np.float32 if cur_key == 'SA' else None
             if isinstance(cur_db_filename,list):
-                cur_db = pd.DataFrame()
-                for cur_file in cur_db_filename:
-                    tmp = pd.read_csv(cur_file,index_col=False,header=None)
-                    cur_db = pd.concat([cur_db, tmp], ignore_index=True)
+                cur_db = pd.concat([pd.read_csv(cur_file,index_col=False,header=None,dtype=cur_dtype) for cur_file in cur_db_filename],
+                                   ignore_index=True)
             else:
-                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None)
+                cur_db = pd.read_csv(cur_db_filename,index_col=False,header=None,dtype=cur_dtype)
             self.gmdb.update({cur_key: cur_db})
+        # check that all record-wise tables are aligned with SA
+        for cur_key, cur_db in self.gmdb.items():
+            if cur_key != 'Periods' and len(cur_db) != len(self.gmdb['SA']):
+                raise ValueError('GroundMotionSelection.__load_gmdb: {} has {} rows but SA has {} rows.'.format(
+                    cur_key, len(cur_db), len(self.gmdb['SA'])))
         self.gmdb_periods = self.gmdb.get('Periods').to_numpy().flatten().tolist()
         self.gmdb_imv = self.gmdb['SA'].to_numpy()
 
@@ -409,9 +440,75 @@ class GroundMotionSelection:
                 self.gmdb_imv = np.concatenate((self.gmdb_imv, tmp[self.gm_flag,:]), axis=1)
             else:
                 pass    
+        # added (zm)
+        self.__load_event_id()
+        # end of addition
         self.gmdb_status = True
 
     
+    def __load_event_id(self):
+        """
+        added (zm): attach an earthquake-event code to every candidate record.
+
+        gmdb/nga_west_event.csv is row-aligned with gmdb/nga_west_filename.csv and carries
+        the EQID / Earthquake Name pulled from the NGA-West2 flatfile. EQID is used rather
+        than the event tag inside the filename because that tag is not unique (e.g. 7
+        distinct EQIDs share the 'COALINGA' tag, 8 share 'GREECE').
+        """
+        if not self.event_penalty_on:
+            return
+        if self.event_file is None:
+            raise ValueError('GroundMotionSelection.__load_event_id: EventPenalty requires an "EventID" '
+                             'table (columns EQID, EarthquakeName) in the Database definition.')
+        df_event = pd.read_csv(self.event_file,dtype={'EQID':str})
+        if len(df_event) != len(self.gm_scaling):
+            raise ValueError(
+                'GroundMotionSelection.__load_event_id: event table has {} rows but the '
+                'ground motion database has {}.'.format(len(df_event),len(self.gm_scaling)))
+        all_label = df_event['EQID'].astype(str).to_numpy()
+        all_name = df_event['EarthquakeName'].astype(str).to_numpy()
+        self.gm_event_label = all_label[self.gm_flag]
+        self.gm_event_name = all_name[self.gm_flag]
+        self.event_labels, self.gm_event_code = np.unique(self.gm_event_label,return_inverse=True)
+        self.num_event = len(self.event_labels)
+        # feasibility check
+        capacity = self.num_event*self.max_per_event
+        print('GroundMotionSelection: event penalty enabled '
+              '(MaxPerEvent={}, SoftCap={}, Mode={}).'.format(
+                  self.max_per_event,self.event_soft_cap,self.event_penalty_mode))
+        print('GroundMotionSelection: {} distinct events among {} candidate records '
+              '-> capacity {} vs. RecordNum {}.'.format(
+                  self.num_event,len(self.gm_flag),capacity,self.num_rec))
+        if capacity < self.num_rec:
+            print('GroundMotionSelection: WARNING - the cap is infeasible; at least {} '
+                  'events would be needed. Relax the filters or raise MaxPerEvent.'.format(
+                      int(np.ceil(self.num_rec/self.max_per_event))))
+
+
+    def _event_penalty_terms(self,cnt):
+        """added (zm): per-event penalty contribution max(0, n_e - SoftCap) ** Exponent."""
+        return np.power(np.maximum(cnt-self.event_soft_cap,0),self.event_penalty_exp)
+
+
+    def report_event_distribution(self):
+        """added (zm): print how the selected records spread over earthquake events."""
+        if not self.event_penalty_on or self.gm_event_code is None:
+            return
+        cnt = np.bincount(self.gm_event_code[self.selected_id],minlength=self.num_event)
+        order = np.argsort(-cnt)
+        print('GroundMotionSelection: record count per earthquake event')
+        for e in order:
+            if cnt[e] == 0:
+                continue
+            name = self.gm_event_name[self.gm_event_code == e][0]
+            flag = '  <-- over cap' if cnt[e] > self.max_per_event else ''
+            print('  EQID {:>5s}  {:<28s} {:>3d}{}'.format(
+                self.event_labels[e],name[:28],int(cnt[e]),flag))
+        n_over = int(np.sum(cnt > self.max_per_event))
+        print('GroundMotionSelection: {} events used, {} exceeding MaxPerEvent={}.'.format(
+            int(np.sum(cnt > 0)),n_over,self.max_per_event))
+
+
     def __unload_gmdb(self):
         # unload the ground motion database
         self.gmdb = dict()
@@ -441,6 +538,11 @@ class GroundMotionSelection:
                 self.ims_idx.append(len(self.gmdb_periods.shape)+1)
         # selected_id
         self.selected_id = []
+        # added (zm): running per-event counter so the initial solution already honours the
+        # cap -- starting the greedy search deep inside the penalised region rarely recovers
+        ev_cnt = np.zeros(self.num_event,dtype=int) if self.event_guard_on else None
+        n_uncapped = 0
+        # end of addition
         for i in range(self.num_rec):
             cur_tgt = self.pseudo_im_rlz[i,:]
             ind_err = np.abs(self.gmdb_imv[:,self.ims_idx]-cur_tgt[np.newaxis,:])
@@ -451,12 +553,34 @@ class GroundMotionSelection:
             else:
                 cur_err = np.mean(ind_err[:,:-1],axis=1)
             cur_sort = np.argsort(cur_err)
-            for cur_id  in cur_sort:
-                if cur_id not in self.selected_id:
+            # added (zm): two passes -- honour the cap first, and only if no candidate is
+            # left does the seat fall back to an unconstrained pick, so an infeasible cap
+            # degrades gracefully instead of silently returning fewer than RecordNum records
+            filled = False
+            for respect_cap in ([True,False] if ev_cnt is not None else [False]):
+                for cur_id in cur_sort:
+                    if cur_id in self.selected_id:
+                        continue
+                    if ev_cnt is not None:
+                        cur_ev = self.gm_event_code[cur_id]
+                        if respect_cap and ev_cnt[cur_ev] >= self.max_per_event:
+                            continue
+                        ev_cnt[cur_ev] += 1
                     self.selected_id.append(int(cur_id))
+                    filled = True
                     break
-                else:
-                    pass
+                if filled:
+                    break
+            if ev_cnt is not None and filled and not respect_cap:
+                n_uncapped += 1
+            # end of addition
+        # added (zm): report the infeasibility once rather than once per seat
+        if ev_cnt is not None and n_uncapped:
+            print('GroundMotionSelection.initial_scanning: WARNING - {} of {} seats could not '
+                  'respect MaxPerEvent={}; the cap is infeasible for this candidate pool. '
+                  'Relax the filters or raise MaxPerEvent.'.format(
+                      n_uncapped,self.num_rec,self.max_per_event))
+        # end of addition
 
     def optimize_selection(self, ims, num_greedy_rounds=2):
         """
@@ -494,8 +618,28 @@ class GroundMotionSelection:
         std_vec = np.std(selected_matrix, axis=0)
         err_mean = np.square(mean_vec - self.tgt_mean)
         err_std = np.square(std_vec - tgt_std)
-        err_tot = (np.mean(err_mean[:-1]) * w_sa_mean + err_mean[-1] * w_ds_mean + np.mean(err_std[:-1]) * w_sa_std + err_std[-1] * w_ds_std)
-        print(f'GroundMotionSelection.optimize_selection: current total error: {err_tot:.6f}.')
+        err_fit = (np.mean(err_mean[:-1]) * w_sa_mean + err_mean[-1] * w_ds_mean + np.mean(err_std[:-1]) * w_sa_std + err_std[-1] * w_ds_std)
+        # added (zm): event penalty bookkeeping
+        ev = self.gm_event_code
+        guard_on = self.event_guard_on
+        soft_on = self.event_soft_on
+        blocked = None
+        pen_cand = None
+        w_ev = 0.0
+        pen_cur = 0.0
+        if soft_on:
+            # Adaptive normalisation: the penalty is scaled by the initial fitting error so
+            # that Weight stays O(1) across sites/periods instead of needing re-tuning.
+            w_ev = self.event_penalty_k*max(err_fit,1e-12)
+            cnt0 = np.bincount(ev[cur_selected_id],minlength=self.num_event)
+            pen_cur = w_ev*float(self._event_penalty_terms(cnt0).sum())
+        err_tot = err_fit + pen_cur
+        if self.event_penalty_on:
+            print(f'GroundMotionSelection.optimize_selection: current total error: {err_tot:.6f} '
+                  f'(fit {err_fit:.6f} + penalty {pen_cur:.6f}, penalty weight {w_ev:.3e}).')
+        else:
+            print(f'GroundMotionSelection.optimize_selection: current total error: {err_tot:.6f}.')
+        # end of addition
         for i in range(num_greedy_rounds):
             for cur_gmseat in range(self.num_rec):
                 print(f'GroundMotionSelection.optimize_selection: {100*(self.num_rec*i+(cur_gmseat+1))/self.num_rec/num_greedy_rounds:.2f}%.')
@@ -505,9 +649,27 @@ class GroundMotionSelection:
                 sum_selected = np.sum(selected_matrix, axis=0)
                 sumsq_selected = np.sum(np.square(selected_matrix), axis=0)
                 old_row = gmdb_subset[old_idx]
+                # added (zm): vacating this seat changes only two event counts, so the whole
+                # candidate pool's penalty can be resolved with one lookup table (O(1) per
+                # candidate) instead of recounting events inside the inner loop
+                if self.event_penalty_on:
+                    cnt_wo = np.bincount(ev[cur_selected_id],minlength=self.num_event)
+                    cnt_wo[ev[old_idx]] -= 1
+                    if guard_on:
+                        blocked = cnt_wo[ev] >= self.max_per_event
+                    if soft_on:
+                        terms_wo = self._event_penalty_terms(cnt_wo)
+                        pen_by_event = w_ev*(terms_wo.sum()-terms_wo
+                                             +self._event_penalty_terms(cnt_wo+1))
+                        pen_cand = pen_by_event[ev]
+                # end of addition
                 for new_gmidx in range(len(self.gm_flag)):
                     if new_gmidx in cur_selected_id:
                         continue  # skip if already selected
+                    # added (zm): hard cap -- this event has no seat left
+                    if blocked is not None and blocked[new_gmidx]:
+                        continue
+                    # end of addition
                     new_row = gmdb_subset[new_gmidx]
                     cur_selected_id[cur_gmseat] = new_gmidx  # trial replace (more in-place in v3)
                     # Update sums and means without full recompute (same as v2)
@@ -521,18 +683,40 @@ class GroundMotionSelection:
                     err_std = np.square(std_adj - tgt_std)
                     # Combined error (same formula as v2, but weights precomputed)
                     err_new = (np.mean(err_mean[:-1]) * w_sa_mean + err_mean[-1] * w_ds_mean + np.mean(err_std[:-1]) * w_sa_std + err_std[-1] * w_ds_std)
+                    # added (zm): fold the event penalty into the objective
+                    if pen_cand is not None:
+                        err_new = err_new + pen_cand[new_gmidx]
+                    # end of addition
                     if err_new < err_tot:
                         self.selected_id = copy.deepcopy(cur_selected_id)
                         err_tot = err_new
+                        # added (zm): keep the split for reporting
+                        if pen_cand is not None:
+                            pen_cur = float(pen_cand[new_gmidx])
+                            err_fit = err_new - pen_cur
+                        # end of addition
                 # MD Correction
                 cur_selected_id = copy.deepcopy(self.selected_id)
-                print(f'GroundMotionSelection.optimize_selection: current total error: {err_tot:.6f}.')
+                if soft_on:
+                    print(f'GroundMotionSelection.optimize_selection: current total error: '
+                          f'{err_tot:.6f} (fit {err_fit:.6f} + penalty {pen_cur:.6f}).')
+                else:
+                    print(f'GroundMotionSelection.optimize_selection: current total error: {err_tot:.6f}.')
+        # added (zm)
+        self.report_event_distribution()
+        # end of addition
 
 
     def export_selection(self, ims, output_dir=None):
+        # output_dir can be None (default location), a directory, or a full .csv file path
         if output_dir is None:
             output_dir = os.path.dirname(__file__)
+        if output_dir.lower().endswith('.csv'):
+            output_path = output_dir
+        else:
             output_path = os.path.join(output_dir,'GroundMotionSelectionResults.csv')
+        if os.path.dirname(output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
         # ground motion names
         self.selected_gm_names = self.gmdb['Filename'].iloc[[self.gm_flag[x] for x in self.selected_id],0].to_list()
         # intensity measures
@@ -548,6 +732,13 @@ class GroundMotionSelection:
         dict_output = {
             'GroundMotion': self.selected_gm_names
         }
+        # added (zm): carry the earthquake event through to the results file
+        if self.event_penalty_on and self.gm_event_code is not None:
+            dict_output.update({
+                'EQID': [self.gm_event_label[x] for x in self.selected_id],
+                'EarthquakeName': [self.gm_event_name[x] for x in self.selected_id]
+            })
+        # end of addition
         for i,cur_period in enumerate(self.gmdb_periods):
             dict_output.update({
                 'SA({})'.format(cur_period): self.selected_im[:,i].tolist()
@@ -607,7 +798,7 @@ def conditional_intensity_measure(im_mean,im_std,im_corr,im_cond_idx,im_cond):
     return cmim, cov_cond
 
 # adding back the run_selection in pygms for batch run (kz)
-def run_selection(gms_config):
+def run_selection(gms_config,out_dir=None):
     with open(gms_config,'r') as f:
         job_config = json.load(f)
 
@@ -624,4 +815,5 @@ def run_selection(gms_config):
     my_gms.initial_scanning(my_tgt.ims,my_tgt.cond_imv,my_tgt.cond_im_idx)
     my_gms.optimize_selection(my_tgt.ims)
 
-    my_gms.export_selection(my_tgt.ims)
+    my_gms.export_selection(my_tgt.ims,out_dir)
+    return my_tgt.im_target
