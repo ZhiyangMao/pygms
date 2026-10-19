@@ -116,7 +116,7 @@ Baker, J. W., and Lee, C. (2018). “[An Improved Algorithm for Selecting Ground
 
 ## License
 
-[Add license information]
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 ## Contributors
 
