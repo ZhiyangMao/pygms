@@ -101,9 +101,10 @@ The default output is a CSV file containing:
 Baker, J. W., and Lee, C. (2018). “[An Improved Algorithm for Selecting Ground Motions to Match a Conditional Spectrum](https://www.jackwbaker.com/Publications/Baker_Lee_(2018)_GM_Selection,_JEE.pdf).” Journal of Earthquake Engineering, 22(4), 708–723. This algorithm is also implemented in [Matlab](https://github.com/bakerjw/CS_Selection).
 
 
+
 ## License
 
-[Add license information]
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 ## Contributors
 
