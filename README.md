@@ -126,9 +126,10 @@ Baker, J. W., and Lee, C. (2018). “[An Improved Algorithm for Selecting Ground
 Pinilla-Ramos, C. I., and Abrahamson, N. A. (2025). “[Duration Models for Subduction Earthquakes](https://doi.org/10.1785/0120240183).” Bulletin of the Seismological Society of America, 115(1), 315–331.
 
 
+
 ## License
 
-[Add license information]
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 ## Contributors
 
